@@ -1,9 +1,24 @@
 [package]
 name = "shrimple-localhost"
-description = "Zero-dependency"
 version = "0.1.0"
 edition = "2021"
+description = "Zero-dependency localhost server, usable both in the terminal and in your Rust code"
+authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
+repository = "https://github.com/schvv31n/shrimple-localhost"
+documentation = "https://docs.rs/shrimple-localhost"
+license = "MIT"
+keywords = ["server", "devtool", "local-server", "localhost"]
+categories = ["development-tools"]
 
 [[bin]]
 name = "shrimple-localhost"
 path = "src/main.rs"
+
+[lints.clippy]
+single_char_lifetime_names = "warn"
+deref_by_slicing = "warn"
+derive_partial_eq_without_eq = "warn"
+expect_used = "warn"
+unwrap_used = "warn"
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"
