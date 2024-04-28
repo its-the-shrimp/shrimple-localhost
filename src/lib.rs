@@ -69,6 +69,31 @@ impl Display for RequestResult {
     }
 }
 
+/// Error returned by [`Server::try_serve_with_callback`] that differentiates between an IO error from
+/// within the server and an error propagated from a callback.
+#[derive(Debug)]
+pub enum ServerError<E> {
+    Io(std::io::Error),
+    Callback(E),
+}
+
+impl<E: Display> Display for ServerError<E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerError::Io(err) => write!(f, "IO error: {err}"),
+            ServerError::Callback(err) => write!(f, "Callback error: {err}"),
+        }
+    }
+}
+
+impl<E> From<std::io::Error> for ServerError<E> {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl<E: std::error::Error> std::error::Error for ServerError<E> {}
+
 impl Server {
     /// Chosen by fair dice roll;
     /// Guaranteed to be random.
@@ -148,13 +173,13 @@ impl Server {
 
     /// This method only consumes the request-line.
     /// `line_buf` & `misc_buf` must be empty.
-    fn respond(
+    fn respond<E>(
         &mut self,
         conn: &mut BufReader<TcpStream>,
         line_buf: &mut String,
         misc_buf: &mut String,
-        on_pending_request: impl FnOnce(&Path),
-    ) -> Result<RequestResult> {
+        on_pending_request: impl FnOnce(&Path) -> Result<(), E>,
+    ) -> Result<RequestResult, ServerError<E>> {
         if !Self::read_http_line(conn, line_buf)? {
             std::io::copy(conn, &mut sink())?;
             return Ok(RequestResult::InvalidNewline)
@@ -197,7 +222,7 @@ impl Server {
             return Ok(RequestResult::FileNotFound(Box::from(path)))
         };
 
-        on_pending_request(&actual_path);
+        on_pending_request(&actual_path).map_err(ServerError::Callback)?;
         let file = File::open(&actual_path)?;
         Self::send_200(conn.get_mut(), file, path_to_mime_type(&actual_path))?;
 
@@ -206,27 +231,62 @@ impl Server {
 
     /// Handles exactly 1 connection, regardless of how many pending connections there currently
     /// are
-    fn handle_conn(
+    fn handle_conn<E>(
         &mut self,
-        mut on_new_conn: impl FnMut(&SocketAddr),
-        mut on_pending_request: impl FnMut(&SocketAddr, &Path),
-        mut on_request: impl FnMut(&SocketAddr, RequestResult),
-        mut on_conn_close: impl FnMut(&SocketAddr),
-    ) -> Result {
+        mut on_new_conn: impl FnMut(&SocketAddr) -> Result<(), E>,
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path) -> Result<(), E>,
+        mut on_request: impl FnMut(&SocketAddr, RequestResult) -> Result<(), E>,
+        mut on_conn_close: impl FnMut(&SocketAddr) -> Result<(), E>,
+    ) -> Result<(), ServerError<E>> {
         let (conn, addr) = self.listener.accept()?;
-        on_new_conn(&addr);
+        on_new_conn(&addr).map_err(ServerError::Callback)?;
         let mut conn = BufReader::new(conn);
         let mut line_buf = String::new();
         let mut misc_buf = String::new();
         loop {
-            match self.respond(&mut conn, &mut line_buf, &mut misc_buf, |p| on_pending_request(&addr, p)) {
-                Ok(result) => on_request(&addr, result),
-                Err(err) if err.kind() == ErrorKind::ConnectionReset => break,
+            match self.respond(
+                &mut conn,
+                &mut line_buf,
+                &mut misc_buf,
+                |p| on_pending_request(&addr, p),
+            ) {
+                Ok(result) => on_request(&addr, result).map_err(ServerError::Callback)?,
+                Err(ServerError::Io(err)) if err.kind() == ErrorKind::ConnectionReset => break,
                 Err(err) => return Err(err),
             }
         }
-        on_conn_close(&addr);
-        OK
+        on_conn_close(&addr).map_err(ServerError::Callback)?;
+        Ok(())
+    }
+
+    /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
+    /// - `on_new_conn` when a new connection is established.
+    /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
+    /// it is a canonical path to an existing file. The actual file is accessed only after the
+    /// callback returns; the callback may take advantage of this arrangement by manipulating
+    /// the file if needed.
+    /// - `on_request` when a new request has been processed, the request result being represented 
+    /// by the 2nd argument to the callback.
+    /// - `on_conn_close` when a connection has been closed by the client. <br />
+    /// This function allows callbacks to return errors & disambiguates server errors & callback
+    /// errors with the [`ServerError`] enum.
+    /// <br /> If no such error propagation is needed, consider using [`Server::serve_with_callback`]
+    /// <br /> If no observation of connections/requests is needed, consider using [`Server::serve`]
+    pub fn try_serve_with_callback<E>(
+        &mut self,
+        mut on_new_conn: impl FnMut(&SocketAddr) -> Result<(), E>,
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path) -> Result<(), E>,
+        mut on_request: impl FnMut(&SocketAddr, RequestResult) -> Result<(), E>,
+        mut on_conn_close: impl FnMut(&SocketAddr) -> Result<(), E>,
+    ) -> Result<Infallible, ServerError<E>> {
+        loop {
+            self.handle_conn(
+                &mut on_new_conn,
+                &mut on_pending_request,
+                &mut on_request,
+                &mut on_conn_close
+            )?
+        }
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
@@ -246,9 +306,15 @@ impl Server {
         mut on_request: impl FnMut(&SocketAddr, RequestResult),
         mut on_conn_close: impl FnMut(&SocketAddr),
     ) -> Result<Infallible> {
-        loop {
-            self.handle_conn(&mut on_new_conn, &mut on_pending_request, &mut on_request, &mut on_conn_close)?
-        }
+        self.try_serve_with_callback::<Infallible>(
+            |addr| Ok(on_new_conn(addr)),
+            |addr, path| Ok(on_pending_request(addr, path)),
+            |addr, req| Ok(on_request(addr, req)),
+            |addr| Ok(on_conn_close(addr))
+        ).map_err(|err| match err {
+            ServerError::Io(err) => err,
+            ServerError::Callback(err) => match err {},
+        })
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error. <br />
@@ -259,29 +325,29 @@ impl Server {
     }
 }
 
-/// Serve files from the current directory at port [`Server::DEFAULT_PORT`].
-/// <br /> If a custom port needs to be provided, use [`serve_current_dir_at`];
-/// <br /> If a custom root needs to be provided, use [`serve`].
+/// Serve files from the current directory at port [`Server::DEFAULT_PORT`]
+/// <br /> If a custom port needs to be provided, use [`serve_current_dir_at`]
+/// <br /> If a custom root needs to be provided, use [`serve`]
 pub fn serve_current_dir() -> Result<Infallible> {
     Server::current_dir()?.serve()
 }
 
-/// Serve files from `root` at port [`Server::DEFAULT_PORT`].
-/// <br /> If a custom port needs to be provided, use [`serve_at`];
-/// <br /> If `root` is only ever supposed to be the current directory, use [`serve_current_dir`].
+/// Serve files from `root` at port [`Server::DEFAULT_PORT`]
+/// <br /> If a custom port needs to be provided, use [`serve_at`]
+/// <br /> If `root` is only ever supposed to be the current directory, use [`serve_current_dir`]
 pub fn serve(root: impl AsRef<Path>) -> Result<Infallible> {
     Server::new(root)?.serve()
 }
 
-/// Serve files from `root` at port [`Server::DEFAULT_PORT`].
-/// <br /> If it doesn't matter what port is used, use [`serve_current_dir`];
-/// <br /> If a custom root needs to be provided, use [`serve_at`].
+/// Serve files from `root` at port [`Server::DEFAULT_PORT`]
+/// <br /> If it doesn't matter what port is used, use [`serve_current_dir`]
+/// <br /> If a custom root needs to be provided, use [`serve_at`]
 pub fn serve_current_dir_at(port: u16) -> Result<Infallible> {
     Server::current_dir_at(port)?.serve()
 }
 
-/// Serve files from `root` at `addr`.
-/// <br /> If it doesn't matter what port is used, use [`serve`];
+/// Serve files from `root` at `addr`
+/// <br /> If it doesn't matter what port is used, use [`serve`]
 /// <br /> If `root` is only ever supposed to be the current directory, use [`serve_current_dir_at`]
 pub fn serve_at(root: impl AsRef<Path>, port: u16) -> Result<Infallible> {
     Server::new_at(root, port)?.serve()

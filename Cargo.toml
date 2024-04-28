@@ -1,6 +1,6 @@
 [package]
 name = "shrimple-localhost"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Zero-dependency localhost server, usable both in the terminal and in your Rust code"
 authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
@@ -15,6 +15,7 @@ name = "shrimple-localhost"
 path = "src/main.rs"
 
 [lints.clippy]
+unit_arg = "allow"
 single_char_lifetime_names = "warn"
 deref_by_slicing = "warn"
 derive_partial_eq_without_eq = "warn"
