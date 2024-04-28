@@ -88,6 +88,7 @@ fn main() -> Result<(), Error> {
     println!("serving files from {root:?} at \"http://localhost:{port}/\"");
     Server::new_at(root, port)?.serve_with_callback(
         |addr| println!("Connection established with {addr}"),
+        |_, _| (),
         |addr, res| println!("Request processed from {addr}, result: {res}"),
         |addr| println!("Connection closed with {addr}"),
     )?;

@@ -153,6 +153,7 @@ impl Server {
         conn: &mut BufReader<TcpStream>,
         line_buf: &mut String,
         misc_buf: &mut String,
+        on_pending_request: impl FnOnce(&Path),
     ) -> Result<RequestResult> {
         if !Self::read_http_line(conn, line_buf)? {
             std::io::copy(conn, &mut sink())?;
@@ -196,6 +197,7 @@ impl Server {
             return Ok(RequestResult::FileNotFound(Box::from(path)))
         };
 
+        on_pending_request(&actual_path);
         let file = File::open(&actual_path)?;
         Self::send_200(conn.get_mut(), file, path_to_mime_type(&actual_path))?;
 
@@ -207,6 +209,7 @@ impl Server {
     fn handle_conn(
         &mut self,
         mut on_new_conn: impl FnMut(&SocketAddr),
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path),
         mut on_request: impl FnMut(&SocketAddr, RequestResult),
         mut on_conn_close: impl FnMut(&SocketAddr),
     ) -> Result {
@@ -216,7 +219,7 @@ impl Server {
         let mut line_buf = String::new();
         let mut misc_buf = String::new();
         loop {
-            match self.respond(&mut conn, &mut line_buf, &mut misc_buf) {
+            match self.respond(&mut conn, &mut line_buf, &mut misc_buf, |p| on_pending_request(&addr, p)) {
                 Ok(result) => on_request(&addr, result),
                 Err(err) if err.kind() == ErrorKind::ConnectionReset => break,
                 Err(err) => return Err(err),
@@ -227,18 +230,24 @@ impl Server {
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
-    /// - `on_new_conn` when a new connection is established;
-    /// - `on_request` when a new request has been processed;
-    /// - `on_conn_close` when a connection has been closed by the client.
+    /// - `on_new_conn` when a new connection is established.
+    /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
+    /// it is a canonical path to an existing file. The actual file is accessed only after the
+    /// callback returns; the callback may take advantage of this arrangement by manipulating
+    /// the file if needed.
+    /// - `on_request` when a new request has been processed, the request result being represented 
+    /// by the 2nd argument to the callback.
+    /// - `on_conn_close` when a connection has been closed by the client. <br />
     /// If no observation of connections/requests is needed, consider using [`Server::serve`]
     pub fn serve_with_callback(
         &mut self,
         mut on_new_conn: impl FnMut(&SocketAddr),
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path),
         mut on_request: impl FnMut(&SocketAddr, RequestResult),
         mut on_conn_close: impl FnMut(&SocketAddr),
     ) -> Result<Infallible> {
         loop {
-            self.handle_conn(&mut on_new_conn, &mut on_request, &mut on_conn_close)?
+            self.handle_conn(&mut on_new_conn, &mut on_pending_request, &mut on_request, &mut on_conn_close)?
         }
     }
 
@@ -246,7 +255,7 @@ impl Server {
     /// If connections/requests need to be observed (e.g. logged), use
     /// [`Server::serve_with_callback`]
     pub fn serve(&mut self) -> Result<Infallible> {
-        self.serve_with_callback(|_| (), |_, _| (), |_| ())
+        self.serve_with_callback(|_| (), |_, _| (), |_, _| (), |_| ())
     }
 }
 
