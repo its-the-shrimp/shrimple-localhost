@@ -1,6 +1,6 @@
 [package]
 name = "shrimple-localhost"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Zero-dependency localhost server, usable both in the terminal and in your Rust code"
 authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
@@ -22,3 +22,6 @@ expect_used = "warn"
 unwrap_used = "warn"
 explicit_iter_loop = "warn"
 explicit_into_iter_loop = "warn"
+
+[clippy.rust]
+rust_2018_idioms = "warn"

@@ -1,3 +1,10 @@
+//! Zero-dependency simple synchronous localhost server.
+//! The 2 ways to use the library are:
+//! - [`serve_current_dir`], [`serve`], [`serve_current_dir_at`], [`serve_at`] functions, the simpler approach.
+//! - [`Server`] struct, the more complex approach.
+//! If inspecting incoming connections & requests is needed (e.g. for logging), the 2nd approach
+//! will be better, otherwise the 1st one will be easier.
+
 mod mime;
 
 use std::{
@@ -19,7 +26,7 @@ fn relative_path_components(path: &Path) -> impl Iterator<Item = impl AsRef<Path
     })
 }
 
-pub type Result<T = (), E = std::io::Error> = std::result::Result<T, E>;
+type Result<T = (), E = std::io::Error> = std::result::Result<T, E>;
 const OK: Result = Ok(());
 
 /// Server for serving files locally
@@ -243,30 +250,30 @@ impl Server {
     }
 }
 
-/// Serve files from the current directory at port [`Server::DEFAULT_PORT`]
-/// If a custom port needs to be provided, use [`serve_current_dir_at`];
-/// If a custom root needs to be provided, use [`serve`].
+/// Serve files from the current directory at port [`Server::DEFAULT_PORT`].
+/// <br /> If a custom port needs to be provided, use [`serve_current_dir_at`];
+/// <br /> If a custom root needs to be provided, use [`serve`].
 pub fn serve_current_dir() -> Result<Infallible> {
     Server::current_dir()?.serve()
 }
 
-/// Serve files from `root` at port [`Server::DEFAULT_PORT`]
-/// If a custom port needs to be provided, use [`serve_at`];
-/// If `root` is only ever supposed to be the current directory, use [`serve_current_dir`].
+/// Serve files from `root` at port [`Server::DEFAULT_PORT`].
+/// <br /> If a custom port needs to be provided, use [`serve_at`];
+/// <br /> If `root` is only ever supposed to be the current directory, use [`serve_current_dir`].
 pub fn serve(root: impl AsRef<Path>) -> Result<Infallible> {
     Server::new(root)?.serve()
 }
 
-/// Serve files from `root` at port [`Server::DEFAULT_PORT`]
-/// If it doesn't matter what port is used, use [`serve_current_dir`];
-/// If a custom root needs to be provided, use [`serve_at`].
+/// Serve files from `root` at port [`Server::DEFAULT_PORT`].
+/// <br /> If it doesn't matter what port is used, use [`serve_current_dir`];
+/// <br /> If a custom root needs to be provided, use [`serve_at`].
 pub fn serve_current_dir_at(port: u16) -> Result<Infallible> {
     Server::current_dir_at(port)?.serve()
 }
 
 /// Serve files from `root` at `addr`.
-/// If it doesn't matter what port is used, use [`serve`];
-/// If `root` is only ever supposed to be the current directory, use [`serve_current_dir_at`]
+/// <br /> If it doesn't matter what port is used, use [`serve`];
+/// <br /> If `root` is only ever supposed to be the current directory, use [`serve_current_dir_at`]
 pub fn serve_at(root: impl AsRef<Path>, port: u16) -> Result<Infallible> {
     Server::new_at(root, port)?.serve()
 }
