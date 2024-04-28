@@ -25,3 +25,6 @@ shrimple-localhost -p 4096 -r ~/website/static
 ```
 ### Library
 More on this in the docs of the library: https://docs.rs/shrimple-localhost
+
+## Limitations
+The server to be made lightweight, thus it's very barebones; it can only handle 1 connection at once, which should be enough for what's merely a development tool.
