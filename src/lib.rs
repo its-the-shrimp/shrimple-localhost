@@ -12,9 +12,10 @@ use std::{
     env::current_dir,
     fmt::{Display, Formatter},
     fs::File,
-    io::{sink, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Error, ErrorKind, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::{Component, Path, PathBuf}
+    path::{Component, Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 use mime::path_to_mime_type;
 
@@ -27,30 +28,45 @@ fn relative_path_components(path: &Path) -> impl Iterator<Item = impl AsRef<Path
 }
 
 type Result<T = (), E = std::io::Error> = std::result::Result<T, E>;
-const OK: Result = Ok(());
 
-/// Server for serving files locally
-pub struct Server {
-    root: PathBuf,
-    listener: TcpListener,
+/// Data associated with a successful request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    /// Canonical path to the file that was requested
+    pub path: Box<Path>,
+    /// Value of the `If-None-Match` header
+    etag: Option<u64>,
+}
+
+impl Request {
+    /// Returns a boolean indicating whether the client relied on their own cached version of the
+    /// file;
+    ///
+    /// `true` means that the client provided an ETag that matched the current version of the file,
+    /// and expectedly received a 304 "Not Modified" response without the contents of the file.
+    pub fn client_cache_reused(&self) -> bool {
+        self.etag.is_some()
+    }
 }
 
 /// The result of a request.
 /// This doesn't report IO errors, since in a case of such error no request is registered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestResult {
     /// Everything went normally and the client received a 200 response
-    Ok(Box<Path>),
+    Ok(Request),
     /// Unsupported or invalid HTTP method was provided in the request;
     /// This crate only supports GET requests.
     InvalidHttpMethod,
-    /// The request used something other than "\r\n" as a newline separator
-    InvalidNewline,
-    /// No path was provided in the request
+    /// No path was provided in the request.
     NoRequestedPath,
     /// Unsupported HTTP version provided in the request; this crate only;
     /// This crate only supports HTTP/1.1
     InvalidHttpVersion,
+    /// One of the headers in the request was invalid.
+    /// At the moment, this only triggers on an invalid `If-None-Match` header, the server ignores
+    /// all other headers.
+    InvalidHeader,
     /// Request file does not exist or is outside the root of the server.
     FileNotFound(Box<Path>),
 }
@@ -59,10 +75,14 @@ impl Display for RequestResult {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use RequestResult::*;
         match self {
-            Ok(path) => write!(f, "requested file {path:?} successfully provided"),
+            Ok(req @Request {path, ..}) => if req.client_cache_reused() {
+                write!(f, "requested file {path:?} already exists in the client's cache")
+            } else {
+                write!(f, "requested file {path:?} successfully provided")
+            }
             InvalidHttpMethod => write!(f, "unsupported/invalid HTTP method encountered"),
-            InvalidNewline => write!(f, "invalid newline encountered"),
             NoRequestedPath => write!(f, "no path provided in the request"),
+            InvalidHeader => write!(f, "invalid `If-None-Match` header format encountered"),
             InvalidHttpVersion => write!(f, "unsupported/invalid HTTP version encountered"),
             FileNotFound(path) => write!(f, "requested file {path:?} not found"),
         }
@@ -93,6 +113,14 @@ impl<E> From<std::io::Error> for ServerError<E> {
 }
 
 impl<E: std::error::Error> std::error::Error for ServerError<E> {}
+
+/// Server for serving files locally
+pub struct Server {
+    root: PathBuf,
+    listener: TcpListener,
+    line_buf: String,
+    misc_buf: String,
+}
 
 impl Server {
     /// Chosen by fair dice roll;
@@ -132,71 +160,94 @@ impl Server {
     }
 
     fn _new(root: PathBuf, port: u16) -> Result<Self> {
-        Ok(Self { root, listener: TcpListener::bind((Ipv4Addr::LOCALHOST, port))? })
+        Ok(Self {
+            root,
+            listener: TcpListener::bind((Ipv4Addr::LOCALHOST, port))?,
+            line_buf: String::new(),
+            misc_buf: String::new(),
+        })
     }
 
-    fn read_http_line(reader: &mut impl BufRead, dst: &mut String) -> Result<bool> {
+    fn read_http_line(reader: &mut impl BufRead, dst: &mut String) -> Result<()> {
         dst.clear();
         reader.read_line(dst)?;
-        Ok(dst.pop().zip(dst.pop()) == Some(('\n', '\r')))
+        if dst.pop() == Some('\n') && dst.ends_with('\r') {
+            dst.pop();
+        }
+        Ok(())
     }
 
-    /// `content` is assumed to be in its starting position
-    fn send_200(
+    /// The boolean indicates whether the file was actually sent or if the client already has 
+    /// the current version of the file in their cache
+    fn send_file(
+        &self,
         mut dst: impl Write,
-        mut content: impl Read + Seek,
-        content_type: impl Display,
-    ) -> Result {
-        let content_length = content.seek(SeekFrom::End(0))?;
-        content.rewind()?;
+        path: impl AsRef<Path>,
+        etag_to_match: Option<u64>,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        let content_type = path_to_mime_type(path);
+        let etag = path.metadata()?.modified()?
+            .duration_since(UNIX_EPOCH).map_err(|_| {
+                Error::other(format!("last modification time of {path:?} is before the Unix epoch"))
+            })?.as_secs();
+        if etag_to_match.is_some_and(|x| x == etag) {
+            write!(dst, "HTTP/1.1 304 Not Modified\r\n\
+                                Connection: close\r\n\
+                                ETag: \"{etag:x}\"\r\n\
+                                Cache-Control: public; must-revalidate\r\n\
+                                \r\n")?;
+            return Ok(false)
+        }
+        let mut file = File::open(path)?;
+        let content_length = file.seek(SeekFrom::End(0))?;
+        file.rewind()?;
         write!(dst, "HTTP/1.1 200 OK\r\n\
-                     Connection: keep-alive\r\n\
+                     Connection: close\r\n\
                      Content-Type: {content_type}\r\n\
                      Content-Length: {content_length}\r\n\
+                     ETag: \"{etag:x}\"\r\n\
+                     Cache-Control: public; must-revalidate\r\n\
                      \r\n")?;
-        std::io::copy(&mut content, &mut dst)?;
-        OK
+        std::io::copy(&mut file, &mut dst)?;
+        Ok(true)
+    }
+
+    fn send_400(mut dst: impl Write) -> Result {
+        write!(dst, "HTTP/1.1 400 Bad Request\r\n\
+                     Connection: close\r\n\
+                     \r\n")
     }
 
     fn send_404(mut dst: impl Write) -> Result {
-        dst.write_all(b"HTTP/1.1 404 Not Found\r\n\
-                        Connection: keep-alive\r\n\
-                        Content-Type: text/html\r\n\
-                        Content-Length: 18\r\n\
-                        \r\n\
-                        <h1>Not Found</h1>")
-    }
-
-    fn send_501(mut dst: impl Write) -> Result {
-        dst.write_all(b"HTTP/1.1 501 Not Implemented\r\n")
+        write!(dst, "HTTP/1.1 404 Not Found\r\n\
+                     Connection: close\r\n\
+                     Content-Type: text/html\r\n\
+                     Content-Length: 18\r\n\
+                     \r\n\
+                     <h1>Not Found</h1>")
     }
 
     /// This method only consumes the request-line.
-    /// `line_buf` & `misc_buf` must be empty.
     fn respond<E>(
         &mut self,
-        conn: &mut BufReader<TcpStream>,
-        line_buf: &mut String,
-        misc_buf: &mut String,
-        on_pending_request: impl FnOnce(&Path) -> Result<(), E>,
+        conn: &mut BufReader<TcpStream>
     ) -> Result<RequestResult, ServerError<E>> {
-        if !Self::read_http_line(conn, line_buf)? {
-            std::io::copy(conn, &mut sink())?;
-            return Ok(RequestResult::InvalidNewline)
-        }
+        Self::read_http_line(conn, &mut self.line_buf)?;
+        let mut etag = None;
         loop {
-            misc_buf.clear();
-            if !Self::read_http_line(conn, misc_buf)? {
-                std::io::copy(conn, &mut sink())?;
-                return Ok(RequestResult::InvalidNewline)
-            }
-            if misc_buf.is_empty() {
+            Self::read_http_line(conn, &mut self.misc_buf)?;
+            if let Some(etag_raw) = self.misc_buf.strip_prefix("If-None-Match: ") {
+                etag = match u64::from_str_radix(etag_raw.trim_matches('"'), 16) {
+                    Ok(x) => Some(x),
+                    Err(_) => return Ok(RequestResult::InvalidHeader),
+                }
+            } else if self.misc_buf.is_empty() {
                 break;
             }
         }
 
-        let Some(path_and_version) = line_buf.strip_prefix("GET ") else {
-            Self::send_501(conn.get_mut())?;
+        let Some(path_and_version) = self.line_buf.strip_prefix("GET ") else {
             return Ok(RequestResult::InvalidHttpMethod)
         };
         let Some((path, http_version)) = path_and_version.split_once(' ') else {
@@ -208,109 +259,110 @@ impl Server {
         let path = if path == "/" {
             Path::new("index.html")
         } else {
+            if path.contains("..") {
+                return Ok(RequestResult::FileNotFound(Box::from(Path::new(path))))
+            }
             Path::new(path)
         };
 
         let mut n_comps = 0usize;
         self.root.extend(relative_path_components(path).inspect(|_| n_comps += 1));
-        let actual_path = self.root.canonicalize().ok();
+        let actual_path = self.root.canonicalize();
         for _ in 0 .. n_comps {
             self.root.pop();
         }
-        let Some(actual_path) = actual_path.filter(|p| p.starts_with(&self.root)) else {
-            Self::send_404(conn.get_mut())?;
+        let Ok(actual_path) = actual_path else {
             return Ok(RequestResult::FileNotFound(Box::from(path)))
         };
 
-        on_pending_request(&actual_path).map_err(ServerError::Callback)?;
-        let file = File::open(&actual_path)?;
-        Self::send_200(conn.get_mut(), file, path_to_mime_type(&actual_path))?;
-
-        Ok(RequestResult::Ok(actual_path.into()))
+        Ok(RequestResult::Ok(Request { path: actual_path.into_boxed_path(), etag }))
     }
 
-    /// Handles exactly 1 connection, regardless of how many pending connections there currently
-    /// are
     fn handle_conn<E>(
         &mut self,
-        mut on_new_conn: impl FnMut(&SocketAddr) -> Result<(), E>,
+        conn: TcpStream,
+        addr: &SocketAddr,
         mut on_pending_request: impl FnMut(&SocketAddr, &Path) -> Result<(), E>,
         mut on_request: impl FnMut(&SocketAddr, RequestResult) -> Result<(), E>,
-        mut on_conn_close: impl FnMut(&SocketAddr) -> Result<(), E>,
     ) -> Result<(), ServerError<E>> {
-        let (conn, addr) = self.listener.accept()?;
-        on_new_conn(&addr).map_err(ServerError::Callback)?;
         let mut conn = BufReader::new(conn);
-        let mut line_buf = String::new();
-        let mut misc_buf = String::new();
-        loop {
-            match self.respond(
-                &mut conn,
-                &mut line_buf,
-                &mut misc_buf,
-                |p| on_pending_request(&addr, p),
-            ) {
-                Ok(result) => on_request(&addr, result).map_err(ServerError::Callback)?,
+        while match conn.get_ref().peek(&mut [0; 4]) {
+            Ok(n) => n > 0,
+            Err(err) => match err.kind() {
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => false,
+                _ => return Err(err.into()),
+            }
+        } {
+            let res = match self.respond(&mut conn) {
+                Ok(RequestResult::Ok(mut path)) => {
+                    on_pending_request(addr, &path.path).map_err(ServerError::Callback)?;
+                    if self.send_file(conn.get_mut(), &path.path, path.etag)? {
+                        path.etag = None;
+                    }
+                    RequestResult::Ok(path)
+                }
+                Ok(RequestResult::FileNotFound(path)) => {
+                    Self::send_404(conn.get_mut())?;
+                    RequestResult::FileNotFound(path)
+                }
+                Ok(res @(| RequestResult::NoRequestedPath
+                         | RequestResult::InvalidHeader
+                         | RequestResult::InvalidHttpVersion
+                         | RequestResult::InvalidHttpMethod)) => {
+                    Self::send_400(conn.get_mut())?;
+                    res
+                }
                 Err(ServerError::Io(err)) if err.kind() == ErrorKind::ConnectionReset => break,
                 Err(err) => return Err(err),
-            }
+            };
+            on_request(addr, res).map_err(ServerError::Callback)?
         }
-        on_conn_close(&addr).map_err(ServerError::Callback)?;
         Ok(())
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
-    /// - `on_new_conn` when a new connection is established.
     /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
     /// it is a canonical path to an existing file. The actual file is accessed only after the
     /// callback returns; the callback may take advantage of this arrangement by manipulating
     /// the file if needed.
     /// - `on_request` when a new request has been processed, the request result being represented 
     /// by the 2nd argument to the callback.
-    /// - `on_conn_close` when a connection has been closed by the client. <br />
     /// This function allows callbacks to return errors & disambiguates server errors & callback
     /// errors with the [`ServerError`] enum.
     /// <br /> If no such error propagation is needed, consider using [`Server::serve_with_callback`]
     /// <br /> If no observation of connections/requests is needed, consider using [`Server::serve`]
     pub fn try_serve_with_callback<E>(
         &mut self,
-        mut on_new_conn: impl FnMut(&SocketAddr) -> Result<(), E>,
         mut on_pending_request: impl FnMut(&SocketAddr, &Path) -> Result<(), E>,
         mut on_request: impl FnMut(&SocketAddr, RequestResult) -> Result<(), E>,
-        mut on_conn_close: impl FnMut(&SocketAddr) -> Result<(), E>,
     ) -> Result<Infallible, ServerError<E>> {
         loop {
+            let (conn, addr) = self.listener.accept()?;
             self.handle_conn(
-                &mut on_new_conn,
+                conn,
+                &addr,
                 &mut on_pending_request,
                 &mut on_request,
-                &mut on_conn_close
-            )?
+            )?;
         }
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
-    /// - `on_new_conn` when a new connection is established.
     /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
     /// it is a canonical path to an existing file. The actual file is accessed only after the
     /// callback returns; the callback may take advantage of this arrangement by manipulating
     /// the file if needed.
     /// - `on_request` when a new request has been processed, the request result being represented 
     /// by the 2nd argument to the callback.
-    /// - `on_conn_close` when a connection has been closed by the client. <br />
     /// If no observation of connections/requests is needed, consider using [`Server::serve`]
     pub fn serve_with_callback(
         &mut self,
-        mut on_new_conn: impl FnMut(&SocketAddr),
-        mut on_pending_request: impl FnMut(&SocketAddr, &Path),
-        mut on_request: impl FnMut(&SocketAddr, RequestResult),
-        mut on_conn_close: impl FnMut(&SocketAddr),
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path) + Send + Sync,
+        mut on_request: impl FnMut(&SocketAddr, RequestResult) + Send + Sync,
     ) -> Result<Infallible> {
         self.try_serve_with_callback::<Infallible>(
-            |addr| Ok(on_new_conn(addr)),
             |addr, path| Ok(on_pending_request(addr, path)),
             |addr, req| Ok(on_request(addr, req)),
-            |addr| Ok(on_conn_close(addr))
         ).map_err(|err| match err {
             ServerError::Io(err) => err,
             ServerError::Callback(err) => match err {},
@@ -321,7 +373,7 @@ impl Server {
     /// If connections/requests need to be observed (e.g. logged), use
     /// [`Server::serve_with_callback`]
     pub fn serve(&mut self) -> Result<Infallible> {
-        self.serve_with_callback(|_| (), |_, _| (), |_, _| (), |_| ())
+        self.serve_with_callback(|_, _| (), |_, _| ())
     }
 }
 
