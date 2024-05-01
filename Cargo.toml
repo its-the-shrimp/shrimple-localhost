@@ -1,6 +1,6 @@
 [package]
 name = "shrimple-localhost"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2021"
 description = "Zero-dependency localhost server, usable both in the terminal and in your Rust code"
 authors = ["Tim Kurdov <tim.kurdov@gmail.com>"]
