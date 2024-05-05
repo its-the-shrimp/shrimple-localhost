@@ -68,25 +68,8 @@ pub enum RequestResult {
     /// all other headers.
     InvalidHeader,
     /// Request file does not exist or is outside the root of the server.
-    FileNotFound(Box<Path>),
-}
-
-impl Display for RequestResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        use RequestResult::*;
-        match self {
-            Ok(req @Request {path, ..}) => if req.client_cache_reused() {
-                write!(f, "requested file {path:?} already exists in the client's cache")
-            } else {
-                write!(f, "requested file {path:?} successfully provided")
-            }
-            InvalidHttpMethod => write!(f, "unsupported/invalid HTTP method encountered"),
-            NoRequestedPath => write!(f, "no path provided in the request"),
-            InvalidHeader => write!(f, "invalid `If-None-Match` header format encountered"),
-            InvalidHttpVersion => write!(f, "unsupported/invalid HTTP version encountered"),
-            FileNotFound(path) => write!(f, "requested file {path:?} not found"),
-        }
-    }
+    /// Contained is the path as requested by the client ("/" is replaced with "/index.html")
+    FileNotFound(Box<str>),
 }
 
 /// Error returned by [`Server::try_serve_with_callback`] that differentiates between an IO error from
@@ -101,7 +84,7 @@ impl<E: Display> Display for ServerError<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::Io(err) => write!(f, "IO error: {err}"),
-            ServerError::Callback(err) => write!(f, "Callback error: {err}"),
+            ServerError::Callback(err) => Display::fmt(err, f),
         }
     }
 }
@@ -231,7 +214,7 @@ impl Server {
     /// This method only consumes the request-line.
     fn respond<E>(
         &mut self,
-        conn: &mut BufReader<TcpStream>
+        conn: &mut BufReader<TcpStream>,
     ) -> Result<RequestResult, ServerError<E>> {
         Self::read_http_line(conn, &mut self.line_buf)?;
         let mut etag = None;
@@ -256,14 +239,15 @@ impl Server {
         if http_version != "HTTP/1.1" {
             return Ok(RequestResult::InvalidHttpVersion)
         }
-        let path = if path == "/" {
-            Path::new("index.html")
-        } else {
-            if path.contains("..") {
-                return Ok(RequestResult::FileNotFound(Box::from(Path::new(path))))
-            }
-            Path::new(path)
+        if path.contains("..") {
+            return Ok(RequestResult::FileNotFound(Box::from(path)))
+        }
+
+        let raw_path = match path {
+            "/" => "/index.html",
+            _ => path,
         };
+        let path = Path::new(raw_path);
 
         let mut n_comps = 0usize;
         self.root.extend(relative_path_components(path).inspect(|_| n_comps += 1));
@@ -272,7 +256,7 @@ impl Server {
             self.root.pop();
         }
         let Ok(actual_path) = actual_path else {
-            return Ok(RequestResult::FileNotFound(Box::from(path)))
+            return Ok(RequestResult::FileNotFound(Box::from(raw_path)))
         };
 
         Ok(RequestResult::Ok(Request { path: actual_path.into_boxed_path(), etag }))
@@ -321,16 +305,19 @@ impl Server {
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
-    /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
-    /// it is a canonical path to an existing file. The actual file is accessed only after the
-    /// callback returns; the callback may take advantage of this arrangement by manipulating
-    /// the file if needed.
-    /// - `on_request` when a new request has been processed, the request result being represented 
-    /// by the 2nd argument to the callback.
+    /// - `on_pending_request` when a new request is about to get a 200 response. The arguments to
+    /// it are:
+    ///     - IP of the sender of the request;
+    ///     - Canonical path to the file on the machine.
+    ///
+    /// - `on_request` when a new request has been processed. The arguments to it are:
+    ///     - IP of the sender of the request;
+    ///     - Result of the request.
     /// This function allows callbacks to return errors & disambiguates server errors & callback
     /// errors with the [`ServerError`] enum.
-    /// <br /> If no such error propagation is needed, consider using [`Server::serve_with_callback`]
-    /// <br /> If no observation of connections/requests is needed, consider using [`Server::serve`]
+    ///
+    /// If no such error propagation is needed, consider using [`Server::serve_with_callback`] <br/>
+    /// If no observation of connections/requests is needed, consider using [`Server::serve`]
     pub fn try_serve_with_callback<E>(
         &mut self,
         mut on_pending_request: impl FnMut(&SocketAddr, &Path) -> Result<(), E>,
@@ -348,17 +335,23 @@ impl Server {
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error, calling:
-    /// - `on_pending_request` when a new request is about to get a 200 response. The argument to
-    /// it is a canonical path to an existing file. The actual file is accessed only after the
-    /// callback returns; the callback may take advantage of this arrangement by manipulating
-    /// the file if needed.
-    /// - `on_request` when a new request has been processed, the request result being represented 
-    /// by the 2nd argument to the callback.
-    /// If no observation of connections/requests is needed, consider using [`Server::serve`]
+    /// - `on_pending_request` when a new request is about to get a 200 response. The arguments to
+    /// it are:
+    ///     - IP of the sender of the request;
+    ///     - Canonical path to the file on the machine.
+    ///
+    /// - `on_request` when a new request has been processed. The arguments to it are:
+    ///     - IP of the sender of the request;
+    ///     - Result of the request.
+    /// This function allows callbacks to return errors & disambiguates server errors & callback
+    /// errors with the [`ServerError`] enum.
+    ///
+    /// If no observation of connections/requests is needed, consider using [`Server::serve`] <br/>
+    /// If the callbacks have to return an error, consider using [`Server::try_serve_with_callback`]
     pub fn serve_with_callback(
         &mut self,
-        mut on_pending_request: impl FnMut(&SocketAddr, &Path) + Send + Sync,
-        mut on_request: impl FnMut(&SocketAddr, RequestResult) + Send + Sync,
+        mut on_pending_request: impl FnMut(&SocketAddr, &Path),
+        mut on_request: impl FnMut(&SocketAddr, RequestResult),
     ) -> Result<Infallible> {
         self.try_serve_with_callback::<Infallible>(
             |addr, path| Ok(on_pending_request(addr, path)),
@@ -370,10 +363,45 @@ impl Server {
     }
 
     /// Serve all connections sequentially & indefinitely, returning only on an error. <br />
+    /// Equivalent to [`serve`] function and the like.
+    /// 
     /// If connections/requests need to be observed (e.g. logged), use
     /// [`Server::serve_with_callback`]
     pub fn serve(&mut self) -> Result<Infallible> {
         self.serve_with_callback(|_, _| (), |_, _| ())
+    }
+}
+
+/// Default function for printing the result of a request along with the IP from which it came.
+/// Can be passed to [`Server::serve_with_callback`].
+///
+/// ```rust, no_run
+/// use shrimple_localhost::{Server, print_request_result};
+/// use std::convert::Infallible;
+/// 
+/// fn main() -> std::io::Result<Infallible> {
+///     Server::current_dir()?.serve_with_callback(
+///         |_, _| todo!(),
+///         print_request_result,
+///     )
+/// }
+/// ```
+pub fn print_request_result(addr: &SocketAddr, res: RequestResult) {
+    match res {
+        RequestResult::Ok(req) if req.client_cache_reused() => 
+            println!("{addr}:\n -> GET {}\n <- 304 Not Modified", req.path.display()),
+        RequestResult::Ok(req) => 
+            println!("{addr}:\n -> GET {}\n <- 200 OK", req.path.display()),
+        RequestResult::InvalidHttpMethod =>
+            println!("{addr}:\n -> <invalid HTTP method>\n <- 400 Bad Request"),
+        RequestResult::NoRequestedPath => 
+            println!("{addr}:\n -> <no requested path>\n <- 400 Bad Request"),
+        RequestResult::InvalidHttpVersion =>
+            println!("{addr}:\n -> <invalid HTTP version>\n <- 400 Bad Request"),
+        RequestResult::InvalidHeader => 
+            println!("{addr}:\n -> <invalid header(s)>\n <- 400 Bad Request"),
+        RequestResult::FileNotFound(path) =>
+            println!("{addr}:\n -> GET {path}\n <- 404 Not Found"),
     }
 }
 

@@ -1,5 +1,5 @@
 use std::{env::{args_os, current_dir}, fmt::{Debug, Display, Formatter}, path::PathBuf};
-use shrimple_localhost::Server;
+use shrimple_localhost::{print_request_result, Server};
 
 // #[derive(Display, From)] // :c
 enum Error {
@@ -85,10 +85,7 @@ fn main() -> Result<(), Error> {
     let Some((root, port)) = parse_args()? else {
         return Ok(())
     };
-    println!("serving files from {root:?} at \"http://localhost:{port}/\"");
-    Server::new_at(root, port)?.serve_with_callback(
-        |_, _| (),
-        |addr, res| println!("Request processed from {addr}, result: {res}"),
-    )?;
+    println!("serving files from {root:?} at http://localhost:{port}/");
+    Server::new_at(root, port)?.serve_with_callback(|_, _| (), print_request_result)?;
     Ok(())
 }
