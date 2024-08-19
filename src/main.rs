@@ -86,6 +86,6 @@ fn main() -> Result<(), Error> {
         return Ok(())
     };
     println!("serving files from {root:?} at http://localhost:{port}/");
-    Server::new_at(root, port)?.serve_with_callback(|_, _| (), print_request_result)?;
+    Server::new_at(root, port)?.serve_with_callback(|_, path| path.into(), print_request_result)?;
     Ok(())
 }
