@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "shrimple-localhost"
-version = "4.0.0"
+version = "5.0.0"

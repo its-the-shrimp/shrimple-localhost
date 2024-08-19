@@ -113,12 +113,12 @@ impl Response {
     /// If response data was fetched from the filesystem, the path is printed via
     /// [`Path::display`].
     ///
-    /// Otherwise, "<in-memory>" is printed.
+    /// Otherwise, "&lt;in-memory&gt;" is printed.
     pub fn display(&self) -> impl Display + '_ {
         struct ResponseDisplay<'path>(Option<std::path::Display<'path>>);
 
         impl Display for ResponseDisplay<'_> {
-            fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 match &self.0 {
                     Some(display) => write!(f, "{display}"),
                     None => f.write_str("<in-memory>"),
@@ -143,7 +143,7 @@ impl Response {
         })
     }
 
-    fn to_reader(&self) -> Result<ResponseReader> {
+    fn to_reader(&self) -> Result<ResponseReader<'_>> {
         Ok(match self {
             Self::Path(path) => ResponseReader::Path(File::open(path)?),
             Self::Data(vec) => ResponseReader::Data(Cursor::new(vec)),
@@ -187,7 +187,7 @@ pub enum ServerError<E> {
 }
 
 impl<E: Display> Display for ServerError<E> {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::Io(err) => write!(f, "IO error: {err}"),
             ServerError::Callback(err) => Display::fmt(err, f),
