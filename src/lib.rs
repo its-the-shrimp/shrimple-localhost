@@ -347,20 +347,19 @@ impl Server {
             return Ok(RequestResult::FileNotFound(Box::from(path)))
         }
 
-        let raw_path = match path {
+
+        let path = match path.split_once('?').map_or(path, |(path, _query)| path) {
             "/" => "/index.html",
             _ => path,
         };
-        let path = Path::new(raw_path);
-
         let mut n_comps = 0usize;
-        self.root.extend(relative_path_components(path).inspect(|_| n_comps += 1));
+        self.root.extend(relative_path_components(path.as_ref()).inspect(|_| n_comps += 1));
         let actual_path = self.root.canonicalize();
         for _ in 0 .. n_comps {
             self.root.pop();
         }
         let Ok(actual_path) = actual_path else {
-            return Ok(RequestResult::FileNotFound(Box::from(raw_path)))
+            return Ok(RequestResult::FileNotFound(Box::from(path)))
         };
 
         Ok(RequestResult::Ok(Request { sent: Response::Path(actual_path), etag }))
