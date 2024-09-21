@@ -350,10 +350,13 @@ impl Server {
 
         let path = match path.split_once('?').map_or(path, |(path, _query)| path) {
             "/" => "/index.html",
-            _ => path,
+            path => path,
         };
         let mut n_comps = 0usize;
         self.root.extend(relative_path_components(path.as_ref()).inspect(|_| n_comps += 1));
+        if self.root.extension().is_none() {
+            self.root.set_extension("html");
+        }
         let actual_path = self.root.canonicalize();
         for _ in 0 .. n_comps {
             self.root.pop();
