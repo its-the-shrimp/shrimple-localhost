@@ -1,13 +1,13 @@
 use std::path::Path;
 
-fn slice_split_once<T: Eq>(slice: &[T], divisor: T) -> Option<(&[T], &[T])> {
-    slice.iter().position(|x| *x == divisor).map(|i| (&slice[..i], &slice[i + 1 ..]))
+fn slice_rsplit_once<T: Eq>(slice: &[T], divisor: T) -> Option<(&[T], &[T])> {
+    slice.iter().rposition(|x| *x == divisor).map(|i| (&slice[..i], &slice[i + 1 ..]))
 }
 
 /// Returns "text/plain" if the file extension is unrecognised
 pub fn path_to_mime_type(path: impl AsRef<Path>) -> &'static str {
     let path = path.as_ref().as_os_str().as_encoded_bytes();
-    let Some(ext) = slice_split_once(path, b'.').map(|(_base, ext)| ext) else {
+    let Some(ext) = slice_rsplit_once(path, b'.').map(|(_base, ext)| ext) else {
         return "text/plain";
     };
     match ext {

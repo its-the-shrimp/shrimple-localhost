@@ -10,8 +10,8 @@ enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(err) => Display::fmt(&err, f),
-            Error::User(msg) => f.write_str(msg),
+            Self::Io(err) => Display::fmt(&err, f),
+            Self::User(msg) => f.write_str(msg),
         }
     }
 }
